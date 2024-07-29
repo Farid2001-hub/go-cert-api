@@ -1,0 +1,21 @@
+# Fichier: Dockerfile.postgres
+FROM postgres:alpine3.19
+
+# Définir les variables d'environnement
+ENV POSTGRES_USER=test
+ENV POSTGRES_PASSWORD=password
+ENV POSTGRES_DB=test
+
+
+# Copier les scripts d'initialisation si nécessaire
+# COPY ./init-scripts/ /docker-entrypoint-initdb.d/
+
+# Exposer le port PostgreSQL
+EXPOSE 5432
+
+# Ajouter un healthcheck
+#HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=5 \
+#  CMD pg_isready -U test || exit 1
+
+# Définir le volume pour les données PostgreSQL
+#VOLUME /var/lib/postgresql/data

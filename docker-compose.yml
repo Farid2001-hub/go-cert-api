@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:alpine3.19
+    environment:
+      POSTGRES_USER: test2
+      POSTGRES_PASSWORD: password2
+      POSTGRES_DB: test2
+    ports:
+      - 5432:5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test"]
+      interval: 10s
+      retries: 5
+
+  pocketbase:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.pocketbase
+    ports:
+      - 8090:8090
+    volumes:
+      - ./pb_data:/pb/pb_data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8090/api/health || exit 1"]
+      interval: 10s
+      retries: 5
+
+  gocertapi:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pocketbase:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_AUTH: '{"username":"test","password":"password"}'
+      DB_NAME: test
+    ports:
+      - 8080:8080
+
+volumes:
+  postgres_data:

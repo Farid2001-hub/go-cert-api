@@ -1,0 +1,182 @@
+stages:
+  - build
+  - test
+  - push_to_registry_postgres
+  - container_registry_push
+  - push_to_registry_pocketbase
+  - deploy
+  
+
+
+variables:
+  GO_VERSION: "1.22.0"
+  DOCKER_DRIVER: overlay2
+  POCKETBASE_URL: "http://pocketbase:8090"
+  AWS_DEFAULT_REGION: us-east-1  # Remplacez par votre région AWS
+  ECS_CLUSTER_NAME: gocertapicluster  # Remplacez par le nom de votre cluster ECS
+  ECS_SERVICE_NAME: cert_api_service  # Remplacez par le nom de votre service ECS
+  TASK_DEFINITION_NAME: CERTAPITEST  # Remplacez par les nom de votre task definition sur aws
+
+services:
+  - docker:dind
+
+before_script:
+  - apk add --no-cache curl docker-compose
+  #- apt-get update && apt-get install -y curl docker-compose
+  - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+
+test_unitaire:
+  stage: test
+  image: docker:latest
+  services:
+    - name: docker:dind
+      command: ["--experimental"]
+  variables:
+    DOCKER_DRIVER: overlay2
+  before_script:
+    - apk add --no-cache curl docker-compose
+    - docker info
+    - cd $CI_PROJECT_DIR
+  script:
+  - echo "Building and starting Docker Compose services..."
+  - docker-compose up --build -d
+  - echo "Waiting for PostgreSQL and Pocketbase services to be ready..."
+  - sleep 30
+  - echo "Checking service status..."
+  - docker-compose ps
+  - echo "Running tests with verbose output..."
+  - |
+    docker-compose exec -T -e POCKETBASE_URL=$POCKETBASE_URL gocertapi sh -c '
+      go mod tidy &&
+      go test -v ./handlers -run TestUpdateUserHandler &&
+      go test -v ./handlers -run TestDeleteUserHandler &&
+      go test -v ./handlers -run TestCreateCAHandler &&
+      go test -v ./handlers -run TestListCAHandler
+    '
+  after_script:
+    - echo "Docker Compose logs:"
+    - docker-compose logs
+  timeout: 30m
+  tags:
+    - runner_cert_api
+
+build_app:
+  stage: build
+  image: golang:${GO_VERSION}-alpine
+  script:
+    - go mod download
+    - go build -o go-cert-api .
+  artifacts:
+    paths:
+      - go-cert-api
+  tags:
+    - runner_cert_api
+
+container_registry:
+  stage: container_registry_push
+  image: docker:latest
+  services:
+    - docker:dind
+  #rules:
+  #  - changes:
+  #    - Dockerfile
+  #    - "**/*.go"
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE/certificate-api:$CI_COMMIT_SHA .
+    - docker push $CI_REGISTRY_IMAGE/certificate-api:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE/certificate-api:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/certificate-api:latest
+    - docker push $CI_REGISTRY_IMAGE/certificate-api:latest
+  tags:
+    - runner_cert_api
+
+build_and_push_pocketbase:
+  stage: push_to_registry_pocketbase
+  image: docker:latest
+  services:
+    - docker:dind
+  #rules:
+  #  - changes:
+  #    - Dockerfile.pocketbase
+  script:
+    - echo "creation de l'image pocketbase"
+    - docker build -t $CI_REGISTRY_IMAGE/pocketbase:$CI_COMMIT_SHA -f Dockerfile.pocketbase .
+    - docker push $CI_REGISTRY_IMAGE/pocketbase:$CI_COMMIT_SHA
+    - docker tag $CI_REGISTRY_IMAGE/pocketbase:$CI_COMMIT_SHA $CI_REGISTRY_IMAGE/pocketbase:latest
+    - docker push $CI_REGISTRY_IMAGE/pocketbase:latest
+  tags:
+    - runner_cert_api
+
+build_and_push_postgres:
+  stage: push_to_registry_postgres
+  image: docker:latest
+  services:
+    - docker:dind
+  variables:
+    POSTGRES_IMAGE: $CI_REGISTRY_IMAGE/postgres:$CI_COMMIT_SHA
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $POSTGRES_IMAGE -f Dockerfile.postgres .
+    - docker push $POSTGRES_IMAGE
+    - docker tag $POSTGRES_IMAGE $CI_REGISTRY_IMAGE/postgres:latest
+    - docker push $CI_REGISTRY_IMAGE/postgres:latest
+  #rules:
+  #  - changes:
+  #    - Dockerfile.postgres
+  
+  tags:
+    - runner_cert_api
+
+deploy_to_ecs:
+  stage: deploy
+  image: 
+    name: debian:latest
+    entrypoint: [""]
+  variables:
+    APP_IMAGE: $CI_REGISTRY_IMAGE/certificate-api:latest
+    POCKETBASE_IMAGE: $CI_REGISTRY_IMAGE/pocketbase:latest
+    POSTGRES_IMAGE: $CI_REGISTRY_IMAGE/postgres:latest
+  before_script:
+    - apt-get update
+    - apt-get install -y jq awscli
+    - aws --version
+    - aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+    - aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+    - aws configure set region "$AWS_DEFAULT_REGION"
+    - aws configure set aws_session_token "$AWS_SESSION_TOKEN"
+  script:
+    - |
+      TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition $TASK_DEFINITION_NAME --region $AWS_DEFAULT_REGION)
+      TASK_DEFINITION_EXTRACT=$(echo $TASK_DEFINITION | jq '.taskDefinition | {family: .family, taskRoleArn: .taskRoleArn, executionRoleArn: .executionRoleArn, networkMode: .networkMode, containerDefinitions: .containerDefinitions, volumes: .volumes, placementConstraints: .placementConstraints, requiresCompatibilities: .requiresCompatibilities, cpu: .cpu, memory: .memory}')
+      
+      # Vérifier et corriger le workingDirectory pour chaque conteneur
+      NEW_TASK_DEFINITION=$(echo $TASK_DEFINITION_EXTRACT | jq '
+        .containerDefinitions = (.containerDefinitions | map(
+          if .workingDirectory and (.workingDirectory | startswith("/") | not) then
+            .workingDirectory = "/" + .workingDirectory
+          elif .workingDirectory == null or .workingDirectory == "" then
+            del(.workingDirectory)
+          else
+            .
+          end
+        )) |
+        if .requiresCompatibilities == null then .requiresCompatibilities = ["FARGATE"] else . end
+      ')
+      
+      # Mettre à jour les images
+      NEW_TASK_DEFINITION=$(echo $NEW_TASK_DEFINITION | jq --arg APP_IMAGE "$APP_IMAGE" --arg POCKETBASE_IMAGE "$POCKETBASE_IMAGE" --arg POSTGRES_IMAGE "$POSTGRES_IMAGE" '
+        .containerDefinitions[0].image = $APP_IMAGE | 
+        .containerDefinitions[1].image = $POCKETBASE_IMAGE | 
+        .containerDefinitions[2].image = $POSTGRES_IMAGE
+      ')
+      
+      # Enregistrer la nouvelle définition de tâche
+      NEW_TASK_INFO=$(aws ecs register-task-definition --region $AWS_DEFAULT_REGION --cli-input-json "$NEW_TASK_DEFINITION")
+      NEW_REVISION=$(echo $NEW_TASK_INFO | jq -r '.taskDefinition.revision')
+      
+      # Mettre à jour le service ECS
+      aws ecs update-service --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --task-definition $TASK_DEFINITION_NAME:$NEW_REVISION --region $AWS_DEFAULT_REGION
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  tags:
+    - runner_cert_api
